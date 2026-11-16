@@ -4,4 +4,5 @@ mod e2e_padded_files;
 mod e2e_pause_during_check;
 mod e2e_stream;
 mod http_client_hook;
+mod peer_filter;
 pub mod test_util;

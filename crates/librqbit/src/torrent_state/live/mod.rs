@@ -749,6 +749,14 @@ impl TorrentStateLive {
         let _ = self.have_broadcast_tx.send(index);
     }
 
+    /// Whether an address someone else named may be used (`SessionOptions::peer_filter`).
+    fn peer_allowed(&self, addr: SocketAddr) -> bool {
+        self.shared
+            .session
+            .upgrade()
+            .is_some_and(|session| session.peer_allowed(addr))
+    }
+
     pub(crate) fn add_peer_if_not_seen(&self, addr: SocketAddr) -> crate::Result<bool> {
         match self.peers.add_if_not_seen(addr) {
             Some(handle) => handle,
@@ -1227,10 +1235,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         }
         // Lets update outgoing Socket address for incoming connection
         if self.incoming
-            && let Some(port) = hs.port()
+            && let Some(outgoing_addr) =
+                listen_addr_of_incoming(hs, self.addr, |addr| self.state.peer_allowed(addr))
         {
-            let peer_ip = hs.ip_addr().unwrap_or(self.addr.ip());
-            let outgoing_addr = SocketAddr::new(peer_ip, port);
             self.state
                 .peers
                 .with_peer_mut(self.addr, "update outgoing addr", |peer| {
@@ -2124,6 +2131,7 @@ impl PeerHandler {
     fn on_pex_message(&self, msg: UtPex<ByteBuf<'_>>) {
         msg.dropped_peers()
             .chain(msg.added_peers())
+            .filter(|peer| self.state.peer_allowed(peer.addr))
             .for_each(|peer| {
                 self.state
                     .add_peer_if_not_seen(peer.addr)
@@ -2191,4 +2199,81 @@ fn format_peer_client_name(value: &ByteBuf<'_>) -> Option<String> {
     }
 
     Some(client_name)
+}
+
+/// Where an incoming peer says it listens: its extended handshake's port, at the address it
+/// names there, else the one it connected from. None without a port, or when that address
+/// isn't `allowed`: it is one someone else names (`SessionOptions::peer_filter`).
+fn listen_addr_of_incoming(
+    hs: &ExtendedHandshake<ByteBuf>,
+    from: SocketAddr,
+    allowed: impl Fn(SocketAddr) -> bool,
+) -> Option<SocketAddr> {
+    let addr = SocketAddr::new(hs.ip_addr().unwrap_or(from.ip()), hs.port()?);
+    allowed(addr).then_some(addr)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        cell::RefCell,
+        net::{Ipv4Addr, SocketAddr},
+    };
+
+    use buffers::ByteBuf;
+    use librqbit_core::compact_ip::Compact;
+    use peer_binary_protocol::extended::handshake::ExtendedHandshake;
+
+    use super::listen_addr_of_incoming;
+
+    const NAMED: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 7);
+
+    /// An incoming peer's extended handshake with this port and address.
+    fn handshake(port: Option<u32>, ip: Option<Ipv4Addr>) -> ExtendedHandshake<ByteBuf<'static>> {
+        ExtendedHandshake {
+            p: port,
+            ipv4: ip.map(Compact),
+            ..Default::default()
+        }
+    }
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn an_incoming_peer_listens_on_its_port_at_the_address_it_names_or_came_from() {
+        let from = addr("198.51.100.4:40000");
+        let all = |_| true;
+        assert_eq!(
+            listen_addr_of_incoming(&handshake(Some(6881), None), from, all),
+            Some(addr("198.51.100.4:6881"))
+        );
+        assert_eq!(
+            listen_addr_of_incoming(&handshake(Some(6881), Some(NAMED)), from, all),
+            Some(addr("203.0.113.7:6881"))
+        );
+        assert_eq!(
+            listen_addr_of_incoming(&handshake(None, Some(NAMED)), from, all),
+            None
+        );
+    }
+
+    #[test]
+    fn an_incoming_peers_listen_address_that_the_filter_refuses_is_not_used() {
+        let asked = RefCell::new(Vec::new());
+        let refuse = |a| {
+            asked.borrow_mut().push(a);
+            false
+        };
+        assert_eq!(
+            listen_addr_of_incoming(
+                &handshake(Some(80), Some(NAMED)),
+                addr("198.51.100.4:40000"),
+                refuse
+            ),
+            None
+        );
+        assert_eq!(asked.into_inner(), [addr("203.0.113.7:80")]);
+    }
 }

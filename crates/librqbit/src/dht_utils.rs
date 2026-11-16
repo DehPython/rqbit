@@ -24,9 +24,11 @@ use librqbit_core::hash_id::Id20;
 /// count only grows.
 #[derive(Debug, Default)]
 pub struct MetadataProgress {
-    /// Peer addresses the DHT gave (repeats included).
+    /// Peer addresses the DHT gave (repeats included); with a `SessionOptions::peer_filter`,
+    /// the ones it let through.
     pub from_dht: AtomicUsize,
-    /// Peer addresses the trackers gave (repeats included).
+    /// Peer addresses the trackers gave (repeats included); with a filter, the ones it let
+    /// through.
     pub from_trackers: AtomicUsize,
     /// Peer addresses local service discovery gave (repeats included).
     pub from_lsd: AtomicUsize,

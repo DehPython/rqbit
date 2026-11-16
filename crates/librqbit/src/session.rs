@@ -140,6 +140,7 @@ pub struct Session {
 
     pub blocklist: IpRanges,
     pub allowlist: Option<IpRanges>,
+    peer_filter: Option<PeerFilter>,
 
     // Monitoring / tracing / logging
     pub(crate) stats: Arc<SessionStats>,
@@ -437,6 +438,10 @@ impl Default for DhtSessionConfig {
 pub type ConfigureHttpClient =
     Arc<dyn Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder + Send + Sync>;
 
+/// Whether a peer's address that someone else named may be used (see
+/// [`SessionOptions::peer_filter`]).
+pub type PeerFilter = Arc<dyn Fn(SocketAddr) -> bool + Send + Sync>;
+
 pub struct SessionOptions {
     /// DHT configuration. Set to None to disable DHT entirely.
     /// Defaults to DHT enabled with persistence.
@@ -520,6 +525,19 @@ pub struct SessionOptions {
     /// agent): a client's own TLS configuration, for example. A system without CA certificates
     /// can't build reqwest's default one, and the session would not start.
     pub configure_http_client: Option<ConfigureHttpClient>,
+
+    /// Asked about every peer address someone else names, before it is used: the trackers',
+    /// the DHT's, other peers' (PEX), and the one an incoming peer says it listens on (the
+    /// address its extended handshake names, else the one it connected from, with the port
+    /// it gives). An address it refuses is neither connected to nor passed on to other peers.
+    /// For a client that must not be made to connect into the network it sits in, or to a
+    /// server's port. None: every address is used.
+    ///
+    /// Not asked: `initial_peers` and the peers added through the HTTP API (the client's
+    /// own), and local service discovery's (whoever can send to its UDP port, the local
+    /// network). Incoming connections are accepted as before. It is called on the runtime's
+    /// threads, again each time an address is named: it must answer at once.
+    pub peer_filter: Option<PeerFilter>,
 }
 
 impl Default for SessionOptions {
@@ -551,6 +569,7 @@ impl Default for SessionOptions {
             ipv4_only: false,
             client_name_and_version: None,
             configure_http_client: None,
+            peer_filter: None,
         }
     }
 }
@@ -906,6 +925,7 @@ impl Session {
                 trackers: opts.trackers,
                 disable_trackers: opts.disable_trackers,
                 peer_limit: opts.peer_limit,
+                peer_filter: opts.peer_filter,
                 client_name_and_version,
 
                 #[cfg(feature = "disable-upload")]
@@ -1130,6 +1150,13 @@ impl Session {
 
     pub fn get_dht(&self) -> Option<&Dht> {
         self.dht.as_ref()
+    }
+
+    /// Whether an address someone else named may be used ([`SessionOptions::peer_filter`]).
+    pub(crate) fn peer_allowed(&self, addr: SocketAddr) -> bool {
+        self.peer_filter
+            .as_ref()
+            .is_none_or(|allowed| allowed(addr))
     }
 
     fn merge_peer_opts(&self, other: Option<PeerConnectionOptions>) -> PeerConnectionOptions {
@@ -1670,6 +1697,17 @@ impl Session {
                     None => s,
                 })
             };
+        // The peers others name, only the ones the session's filter lets through: counted
+        // after it, so a lookup counts the peers it can ask.
+        let filtered = |stream: Option<BoxStream<'static, SocketAddr>>| {
+            let filter = self.peer_filter.clone();
+            stream.map(|s| match filter {
+                Some(allowed) => s
+                    .filter(move |addr| std::future::ready(allowed(*addr)))
+                    .boxed(),
+                None => s,
+            })
+        };
         let dht_rx = if is_private {
             None
         } else {
@@ -1678,7 +1716,7 @@ impl Session {
                     .boxed()
             })
         };
-        let dht_rx = counted(dht_rx, |p| &p.from_dht);
+        let dht_rx = counted(filtered(dht_rx), |p| &p.from_dht);
 
         let lsd_rx = if is_private {
             None
@@ -1718,7 +1756,7 @@ impl Session {
             self.reqwest_client.clone(),
             self.udp_tracker_client.clone(),
         );
-        let tracker_rx = counted(tracker_rx, |p| &p.from_trackers);
+        let tracker_rx = counted(filtered(tracker_rx), |p| &p.from_trackers);
 
         let initial_peers_rx = if initial_peers.is_empty() {
             None
